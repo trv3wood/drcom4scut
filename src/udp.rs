@@ -8,7 +8,7 @@ use std::time::Duration;
 use bytes::BytesMut;
 use chrono::Local;
 use crossbeam_channel::{Receiver, Sender, TryRecvError, unbounded};
-use log::{debug, error, info};
+use log::{debug, error, info, warn};
 use pnet::datalink::MacAddr;
 
 use crate::settings::Settings;
@@ -130,7 +130,9 @@ impl<'a> Process<'a> {
                                 if cnt > count {
                                     quit.store(true, Ordering::Release);
                                 } else {
-                                    thread::sleep(duration);
+                                    let backoff = duration * (1 << min(cnt, 4));
+                                    let backoff = min(backoff, Duration::from_secs(30));
+                                    thread::sleep(backoff);
                                 }
                             }
                         }
@@ -246,7 +248,9 @@ impl<'a> Process<'a> {
                                     if cnt > count {
                                         quit.store(true, Ordering::Release);
                                     } else {
-                                        thread::sleep(duration);
+                                        let backoff = duration * (1 << min(cnt, 4));
+                                        let backoff = min(backoff, Duration::from_secs(30));
+                                        thread::sleep(backoff);
                                     }
                                 }
                             }
@@ -491,6 +495,7 @@ impl<'a> Process<'a> {
         let timeout = self.timeout.clone();
         let udp_timeout = self.settings.heartbeat.udp_timeout;
         let count = min(self.settings.retry.count, u8::MAX as i32) as u8;
+        let max_timeout_count = count.saturating_mul(3);
         self.heartbeat_handle = Some(Arc::new(thread::Builder::new().name("UDP-Heartbeat".to_owned()).spawn(move || {
             let duration = std::time::Duration::from_secs(udp_timeout as u64);
             loop {
@@ -503,12 +508,17 @@ impl<'a> Process<'a> {
                 }
                 alive.store(true, Ordering::Release);
                 thread::sleep(duration);
-                let mut cnt = timeout.load(Ordering::Relaxed);
-                if cnt > count {
-                    error!("Heartbeat timeout. No Misc Heartbeat packet received for {}s, but ignored.", udp_timeout * cnt as i32);
-                    cnt = 0;
+                let cnt = timeout.fetch_add(1, Ordering::AcqRel);
+                if cnt >= count {
+                    let total_secs = udp_timeout * (cnt as i32 + 1);
+                    if cnt >= max_timeout_count {
+                        error!("Heartbeat timeout. No Misc Heartbeat packet received for {total_secs}s, triggering reconnection.");
+                        stop.store(true, Ordering::Release);
+                        return;
+                    } else {
+                        warn!("Heartbeat timeout. No Misc Heartbeat packet received for {total_secs}s, but ignored.");
+                    }
                 }
-                timeout.store(cnt + 1, Ordering::Release);
             }
         }).expect("Can't create UDP-Heartbeat thread.")));
     }
