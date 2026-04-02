@@ -3,6 +3,7 @@ on: [push, pull_request]
 env:
   CARGO_TERM_COLOR: always
   NPCAP_SDK_URL: "https://npcap.com/dist/npcap-sdk-1.15.zip"
+  NPCAP_SDK_CACHE_DIR: .\tmp\npcap-sdk
   bin_dir: ./tmp_bin
 jobs:
   build:
@@ -29,17 +30,26 @@ jobs:
         id: cache-windows
         uses: actions/cache@v4
         with:
-          key: ${{ env.NPCAP_SDK_URL }}
-          path: .\Packet.lib
+          key: ${{ runner.os }}-${{ env.NPCAP_SDK_URL }}
+          path: ${{ env.NPCAP_SDK_CACHE_DIR }}
       - name: Install Windows dependencies
         if: matrix.os == 'windows-latest' && steps.cache-windows.outputs.cache-hit != 'true'
         shell: pwsh
         run: |
-          $sdkPath = ".\tmp"
-          mkdir $sdkPath
-          Invoke-WebRequest -Uri $env:NPCAP_SDK_URL -OutFile "$sdkPath\npcap-sdk.zip"
-          Expand-Archive -Path "$sdkPath\npcap-sdk.zip" -DestinationPath $sdkPath
-          Copy-Item -Path "$sdkPath\Lib\x64\Packet.lib" -Destination .
+          $sdkRoot = "${{ env.NPCAP_SDK_CACHE_DIR }}"
+          New-Item -ItemType Directory -Path $sdkRoot -Force | Out-Null
+          $zipPath = Join-Path (Split-Path $sdkRoot -Parent) "npcap-sdk.zip"
+          Invoke-WebRequest -Uri $env:NPCAP_SDK_URL -OutFile $zipPath
+          Expand-Archive -Path $zipPath -DestinationPath $sdkRoot -Force
+      - name: Export Windows SDK path
+        if: matrix.os == 'windows-latest'
+        shell: pwsh
+        run: |
+          $sdkRoot = (Resolve-Path "${{ env.NPCAP_SDK_CACHE_DIR }}").Path
+          if (-not (Test-Path (Join-Path $sdkRoot "Lib\\x64\\Packet.lib"))) {
+            throw "Packet.lib not found under $sdkRoot"
+          }
+          "NPCAP_SDK_DIR=$sdkRoot" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
       - name: Build
         run: cargo build --verbose
       - name: Build for release
