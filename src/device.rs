@@ -6,6 +6,7 @@ use pnet::ipnetwork::IpNetwork;
 use std::cell::RefCell;
 use std::io::{Error, ErrorKind, Result};
 use std::net::{IpAddr, Ipv4Addr};
+use std::time::Duration;
 
 pub struct Device {
     pub interface: NetworkInterface,
@@ -100,7 +101,9 @@ impl Device {
                 ),
             ));
         }
-        let ch = channel(&interface, Config::default());
+        let mut config = Config::default();
+        config.read_timeout = Some(Duration::from_millis(500));
+        let ch = channel(&interface, config);
         match ch {
             Ok(Channel::Ethernet(tx, rx)) => Ok(Device {
                 sender: RefCell::new(tx),

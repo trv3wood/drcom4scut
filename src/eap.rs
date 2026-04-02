@@ -15,7 +15,7 @@ use pnet::datalink::MacAddr;
 use crate::device::Device;
 use crate::eap::packet::*;
 use crate::settings::Settings;
-use crate::util::{ChannelData, State, ip_to_vec, sleep};
+use crate::util::{ChannelData, ShutdownSignal, State, ip_to_vec, sleep};
 
 mod packet;
 
@@ -34,6 +34,7 @@ pub struct Process<'a> {
     settings: &'a Settings,
     device: Arc<Device>,
     tx: Sender<ChannelData>,
+    shutdown: ShutdownSignal,
     timeout: Arc<AtomicU8>,
     stop: Arc<AtomicBool>,
     quit: Arc<AtomicBool>,
@@ -49,7 +50,12 @@ pub struct Process<'a> {
 }
 
 impl Process<'_> {
-    pub fn new(settings: &Settings, device: Arc<Device>, tx: Sender<ChannelData>) -> Process<'_> {
+    pub fn new(
+        settings: &Settings,
+        device: Arc<Device>,
+        tx: Sender<ChannelData>,
+        shutdown: ShutdownSignal,
+    ) -> Process<'_> {
         Process {
             eth_header: EthernetHeader {
                 destination: MULTICAST_MAC,
@@ -61,6 +67,7 @@ impl Process<'_> {
                 ..Default::default()
             },
             tx,
+            shutdown,
             timeout: Arc::new(AtomicU8::new(0)),
             stop: Arc::new(AtomicBool::new(false)),
             quit: Arc::new(AtomicBool::new(false)),
@@ -85,6 +92,7 @@ impl Process<'_> {
         let (tx, rx) = unbounded::<Vec<u8>>();
         self.receive_channel = Some(rx);
         let quit = self.quit.clone();
+        let shutdown = self.shutdown.clone();
         let stop = self.stop.clone();
         let count = self.settings.retry.count;
         let interval = self.settings.retry.interval;
@@ -100,6 +108,10 @@ impl Process<'_> {
                             debug!("EAP-Receiver thread quit!");
                             return;
                         }
+                        if shutdown.is_shutdown() {
+                            quit.store(true, Ordering::Release);
+                            return;
+                        }
                         if stop.load(Ordering::Relaxed) {
                             thread::park();
                         }
@@ -112,6 +124,12 @@ impl Process<'_> {
                                 }
                             }
                             Err(e) => {
+                                if matches!(
+                                    e.kind(),
+                                    std::io::ErrorKind::TimedOut | std::io::ErrorKind::WouldBlock
+                                ) {
+                                    continue;
+                                }
                                 error!("Receive error: {e}");
                                 cnt += 1;
                                 if cnt > count {
@@ -138,6 +156,7 @@ impl Process<'_> {
         let (tx, rx) = unbounded::<(Vec<u8>, bool)>();
         self.send_channel = Some(tx.clone());
         let quit = self.quit.clone();
+        let shutdown = self.shutdown.clone();
         let stop = self.stop.clone();
         let interval = self.settings.retry.interval;
         let send_ts = self.send_ts.clone();
@@ -149,6 +168,10 @@ impl Process<'_> {
                     loop {
                         if quit.load(Ordering::Relaxed) {
                             debug!("EAP-Resender thread quit!");
+                            return;
+                        }
+                        if shutdown.is_shutdown() {
+                            quit.store(true, Ordering::Release);
                             return;
                         }
                         if stop.load(Ordering::Relaxed) {
@@ -176,6 +199,7 @@ impl Process<'_> {
         );
         self.resender_handle = Some(resender_handle.clone());
         let quit = self.quit.clone();
+        let shutdown = self.shutdown.clone();
         let stop = self.stop.clone();
         let device = self.device.clone();
         let count = self.settings.retry.count;
@@ -192,6 +216,10 @@ impl Process<'_> {
                     loop {
                         if quit.load(Ordering::Relaxed) {
                             debug!("EAP-Sender thread quit!");
+                            return;
+                        }
+                        if shutdown.is_shutdown() {
+                            quit.store(true, Ordering::Release);
                             return;
                         }
                         if stop.load(Ordering::Relaxed) {
@@ -213,7 +241,10 @@ impl Process<'_> {
                         }
                         let mut cnt = 0;
                         loop {
-                            if quit.load(Ordering::Relaxed) || stop.load(Ordering::Relaxed) {
+                            if quit.load(Ordering::Relaxed)
+                                || stop.load(Ordering::Relaxed)
+                                || shutdown.is_shutdown()
+                            {
                                 break;
                             }
                             debug!("Sender is sending packet: {}", hex::encode(&data[..]));
@@ -279,12 +310,21 @@ impl Process<'_> {
     }
 
     pub fn start(&mut self) -> State {
+        if self.shutdown.is_shutdown() {
+            self.quit.store(true, Ordering::Release);
+            return State::Quit;
+        }
         self.stop.store(false, Ordering::Release);
         self.start_receive_thread();
         self.start_send_thread();
         self.login_start();
         let mut ret = false;
         while !self.stop.load(Ordering::Relaxed) {
+            if self.shutdown.is_shutdown() {
+                self.quit.store(true, Ordering::Release);
+                self.stop.store(true, Ordering::Release);
+                return State::Quit;
+            }
             if self.quit.load(Ordering::Relaxed) {
                 debug!("EAP-Process thread quit!");
                 if let Err(e) = self.tx.try_send(ChannelData {
@@ -487,6 +527,7 @@ impl Process<'_> {
             return;
         }
         let quit = self.quit.clone();
+        let shutdown = self.shutdown.clone();
         let stop = self.stop.clone();
         let timeout = self.timeout.clone();
         let eap_timeout = self.settings.heartbeat.eap_timeout;
@@ -500,6 +541,10 @@ impl Process<'_> {
                     loop {
                         if quit.load(Ordering::Relaxed) {
                             debug!("EAP-Heartbeat thread quit!");
+                            return;
+                        }
+                        if shutdown.is_shutdown() {
+                            quit.store(true, Ordering::Release);
                             return;
                         }
                         if stop.load(Ordering::Relaxed) {

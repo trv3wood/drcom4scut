@@ -1,11 +1,11 @@
-use crate::Settings;
+use crate::settings::{RuntimeMode, Settings};
 
 #[allow(unused_variables)]
-pub fn init(settings: &Settings) {
+pub fn init(settings: &Settings, debug: bool, mode: RuntimeMode) {
     #[cfg(not(feature = "log4rs"))]
     simple_logger::init();
     #[cfg(feature = "log4rs")]
-    init_log4rs(settings);
+    init_log4rs(settings, debug, mode);
 }
 
 #[cfg(not(feature = "log4rs"))]
@@ -47,11 +47,10 @@ mod simple_logger {
 }
 
 #[cfg(feature = "log4rs")]
-fn init_log4rs(settings: &Settings) {
+fn init_log4rs(settings: &Settings, debug: bool, mode: RuntimeMode) {
     if log::LevelFilter::Off == settings.log.level_filter {
         return;
     }
-    use crate::settings::DEBUG;
     use log4rs::{
         append::{
             console::ConsoleAppender,
@@ -66,7 +65,7 @@ fn init_log4rs(settings: &Settings) {
         config::{Appender, Config, Root},
         encode::pattern::PatternEncoder,
     };
-    let stdout = if *DEBUG || settings.log.enable_console {
+    let stdout = if matches!(mode, RuntimeMode::Console) && (debug || settings.log.enable_console) {
         Some(
             ConsoleAppender::builder()
                 .encoder(Box::new(PatternEncoder::new(
@@ -127,7 +126,7 @@ fn init_log4rs(settings: &Settings) {
 #[test]
 fn test() {
     use log::{debug, error, info, trace, warn};
-    init(&Settings::default());
+    init(&Settings::default(), false, RuntimeMode::Console);
     trace!("trace test");
     debug!("debug test");
     info!("info test");

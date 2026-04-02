@@ -1,5 +1,6 @@
 use std::io;
 use std::net::{IpAddr, Ipv4Addr, SocketAddr, UdpSocket};
+use std::time::Duration;
 
 use log::{error, info};
 use trust_dns_resolver::Resolver;
@@ -60,6 +61,7 @@ pub fn socket_bind(ip: IpAddr) -> Option<UdpSocket> {
         match UdpSocket::bind(SocketAddr::new(IpAddr::V4(Ipv4Addr::UNSPECIFIED), port)) {
             Ok(r) => {
                 if r.connect(address).is_ok() {
+                    let _ = r.set_read_timeout(Some(Duration::from_millis(500)));
                     return Some(r);
                 }
             }

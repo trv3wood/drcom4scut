@@ -17,7 +17,7 @@ use crate::udp::packet::{
     Alive, HeaderType, HeartbeatType, MiscAlive, MiscHeartbeat1, MiscHeartbeat3, MiscInfo,
     decrypt_info,
 };
-use crate::util::{self, ChannelData, State, random_vec, sleep};
+use crate::util::{self, ChannelData, ShutdownSignal, State, random_vec, sleep};
 
 mod packet;
 
@@ -35,6 +35,7 @@ pub struct Process<'a> {
     ip: IpAddr,
     dns: SocketAddr,
     settings: &'a Settings,
+    shutdown: ShutdownSignal,
     socket: Arc<Socket>,
     rx: Receiver<ChannelData>,
     alive: Arc<AtomicBool>,
@@ -63,6 +64,7 @@ impl<'a> Process<'a> {
         mac: MacAddr,
         ip: IpAddr,
         dns: SocketAddr,
+        shutdown: ShutdownSignal,
     ) -> Process<'a> {
         Process {
             alive: Arc::new(AtomicBool::new(false)),
@@ -76,6 +78,7 @@ impl<'a> Process<'a> {
             send_ts: Arc::new(AtomicI64::new(0)),
             cancel_resend: Arc::new(AtomicBool::new(true)),
             settings,
+            shutdown,
             socket,
             rx,
             mac,
@@ -98,6 +101,7 @@ impl<'a> Process<'a> {
         let (tx, rx) = unbounded::<Vec<u8>>();
         self.receive_channel = Some(rx);
         let quit = self.quit.clone();
+        let shutdown = self.shutdown.clone();
         let stop = self.stop.clone();
         let count = self.settings.retry.count;
         let interval = self.settings.retry.interval;
@@ -113,6 +117,10 @@ impl<'a> Process<'a> {
                             debug!("UDP-Receiver thread quit!");
                             return;
                         }
+                        if shutdown.is_shutdown() {
+                            quit.store(true, Ordering::Release);
+                            return;
+                        }
                         if stop.load(Ordering::Relaxed) {
                             thread::park();
                         }
@@ -125,6 +133,12 @@ impl<'a> Process<'a> {
                                 }
                             }
                             Err(e) => {
+                                if matches!(
+                                    e.kind(),
+                                    std::io::ErrorKind::TimedOut | std::io::ErrorKind::WouldBlock
+                                ) {
+                                    continue;
+                                }
                                 error!("Receive error: {e}");
                                 cnt += 1;
                                 if cnt > count {
@@ -153,6 +167,7 @@ impl<'a> Process<'a> {
         let (tx, rx) = unbounded::<(Vec<u8>, bool)>();
         self.send_channel = Some(tx.clone());
         let quit = self.quit.clone();
+        let shutdown = self.shutdown.clone();
         let stop = self.stop.clone();
         let interval = self.settings.retry.interval;
         let send_ts = self.send_ts.clone();
@@ -164,6 +179,10 @@ impl<'a> Process<'a> {
                     loop {
                         if quit.load(Ordering::Relaxed) {
                             debug!("UDP-Resender thread quit!");
+                            return;
+                        }
+                        if shutdown.is_shutdown() {
+                            quit.store(true, Ordering::Release);
                             return;
                         }
                         if stop.load(Ordering::Relaxed) {
@@ -191,6 +210,7 @@ impl<'a> Process<'a> {
         );
         self.resender_handle = Some(resender_handle.clone());
         let quit = self.quit.clone();
+        let shutdown = self.shutdown.clone();
         let stop = self.stop.clone();
         let socket = self.socket.clone();
         let count = self.settings.retry.count;
@@ -207,6 +227,10 @@ impl<'a> Process<'a> {
                     loop {
                         if quit.load(Ordering::Relaxed) {
                             debug!("UDP-Sender thread quit!");
+                            return;
+                        }
+                        if shutdown.is_shutdown() {
+                            quit.store(true, Ordering::Release);
                             return;
                         }
                         if stop.load(Ordering::Relaxed) {
@@ -228,7 +252,10 @@ impl<'a> Process<'a> {
                         }
                         let mut cnt = 0;
                         loop {
-                            if quit.load(Ordering::Relaxed) || stop.load(Ordering::Relaxed) {
+                            if quit.load(Ordering::Relaxed)
+                                || stop.load(Ordering::Relaxed)
+                                || shutdown.is_shutdown()
+                            {
                                 break;
                             }
                             debug!("Sender is sending packet: {}", hex::encode(&data[..]));
@@ -293,6 +320,7 @@ impl<'a> Process<'a> {
         }
         info!("Start to receive message from EAP.");
         let quit = self.quit.clone();
+        let shutdown = self.shutdown.clone();
         let stop = self.stop.clone();
         let sleep = self.sleep.clone();
         let rx = self.rx.clone();
@@ -306,6 +334,10 @@ impl<'a> Process<'a> {
                         if quit.load(Ordering::Relaxed) {
                             info!("Stop receiving message from EAP.");
                             debug!("EAPtoUDP thread quit!");
+                            return;
+                        }
+                        if shutdown.is_shutdown() {
+                            quit.store(true, Ordering::Release);
                             return;
                         }
                         if stop.load(Ordering::Relaxed) {
@@ -356,6 +388,10 @@ impl<'a> Process<'a> {
     }
 
     pub fn start(&mut self) -> State {
+        if self.shutdown.is_shutdown() {
+            self.quit.store(true, Ordering::Release);
+            return State::Quit;
+        }
         self.thread = Arc::new(thread::current());
         self.stop.store(false, Ordering::Release);
         self.start_receive_eap_thread();
@@ -363,6 +399,11 @@ impl<'a> Process<'a> {
         self.start_send_thread();
         self.login_start();
         while !self.stop.load(Ordering::Relaxed) {
+            if self.shutdown.is_shutdown() {
+                self.quit.store(true, Ordering::Release);
+                self.stop.store(true, Ordering::Release);
+                return State::Quit;
+            }
             if self.quit.load(Ordering::Relaxed) {
                 debug!("UDP-Process thread quit!");
                 self.start_receive_eap_thread();
@@ -490,6 +531,7 @@ impl<'a> Process<'a> {
             return;
         }
         let quit = self.quit.clone();
+        let shutdown = self.shutdown.clone();
         let stop = self.stop.clone();
         let alive = self.alive.clone();
         let timeout = self.timeout.clone();
@@ -501,6 +543,10 @@ impl<'a> Process<'a> {
             loop {
                 if quit.load(Ordering::Relaxed) {
                     debug!("UDP-Heartbeat thread quit!");
+                    return;
+                }
+                if shutdown.is_shutdown() {
+                    quit.store(true, Ordering::Release);
                     return;
                 }
                 if stop.load(Ordering::Relaxed) {
