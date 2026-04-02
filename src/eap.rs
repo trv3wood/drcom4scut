@@ -8,7 +8,7 @@ use std::time::Duration;
 use bytes::{Buf, BufMut, Bytes, BytesMut};
 use chrono::Local;
 use crossbeam_channel::{Receiver, Sender, TryRecvError, unbounded};
-use log::{debug, error, info, warn};
+use log::{debug, error, info};
 use md5::Digest;
 use pnet::datalink::MacAddr;
 
@@ -27,6 +27,28 @@ struct ProcessData {
     md5_extra_data: Vec<u8>,
     md5: Vec<u8>,
     response_identity_packet: Option<Vec<u8>>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RequestIdentityAction {
+    HeartbeatResponse,
+    InitialResponse,
+}
+
+fn request_identity_action(
+    identifier: u8,
+    has_cached_identity_response: bool,
+) -> RequestIdentityAction {
+    if has_cached_identity_response {
+        RequestIdentityAction::HeartbeatResponse
+    } else {
+        if identifier > 1 {
+            debug!(
+                "Initial Request, Identity uses identifier {identifier}, continue authentication."
+            );
+        }
+        RequestIdentityAction::InitialResponse
+    }
 }
 
 pub struct Process<'a> {
@@ -393,17 +415,22 @@ impl Process<'_> {
     fn on_request_identity(&mut self, eth_header: &EthernetHeader, eap_header: &EAPHeader) {
         self.cancel_resend();
         self.timeout.store(0, Ordering::Release);
-        if let Some(ref mut v) = self.data.response_identity_packet {
-            v[19] = eap_header.identifier;
-            let v = v.clone();
-            info!("Send Heartbeat(Response, Identity) packet.");
-            self.send(v, false);
-        } else if eap_header.identifier > 1 {
-            warn!("Maybe you have been login.");
-            self.login_start()
-        } else {
-            self.eth_header.destination = eth_header.source;
-            self.send_response_identity(eap_header)
+        match request_identity_action(
+            eap_header.identifier,
+            self.data.response_identity_packet.is_some(),
+        ) {
+            RequestIdentityAction::HeartbeatResponse => {
+                if let Some(ref mut v) = self.data.response_identity_packet {
+                    v[19] = eap_header.identifier;
+                    let v = v.clone();
+                    info!("Send Heartbeat(Response, Identity) packet.");
+                    self.send(v, false);
+                }
+            }
+            RequestIdentityAction::InitialResponse => {
+                self.eth_header.destination = eth_header.source;
+                self.send_response_identity(eap_header);
+            }
         }
     }
 
